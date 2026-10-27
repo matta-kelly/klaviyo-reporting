@@ -1,142 +1,176 @@
-import pandas as pd
-from . import get_client, retry_on_rate_limit, log, CONVERSION_METRIC_ID, FLOW_BATCH_SIZE, STATS_FLOWS
-from openapi_client.models.flow_values_request_dto import FlowValuesRequestDTO
-from openapi_client.models.flow_values_request_dto_resource_object import FlowValuesRequestDTOResourceObject
-from openapi_client.models.flow_values_request_dto_resource_object_attributes import FlowValuesRequestDTOResourceObjectAttributes
-from openapi_client.models.flow_series_request_dto import FlowSeriesRequestDTO
-from openapi_client.models.flow_series_request_dto_resource_object import FlowSeriesRequestDTOResourceObject
-from openapi_client.models.flow_series_request_dto_resource_object_attributes import FlowSeriesRequestDTOResourceObjectAttributes
+"""Flow performance from Klaviyo's reporting API, as a period total or a series.
 
+Every flow id is passed explicitly. A flow report sent without a flow id filter
+returns a subset rather than an error: measured once at about 77% short, with
+nothing in the response to say so. The id list is what makes the answer whole,
+and it caps at 100, so wide accounts take several paced calls.
+
+Flow metadata is fetched once per process and cached. It is a records call, not
+a report, so it is cheap, but it pages through every flow in the account and
+the names do not change between two reports in the same run.
+"""
+from datetime import date
+
+import pandas as pd
+
+from connectors.klaviyo import (
+    CONVERSION_METRIC_ID, FILTER_BATCH, STATS_FLOWS, WINDOW_DAILY, get_client,
+    id_batches, log, quoted,
+)
 
 def _fetch_metadata(client):
-    """Fetch flow names and statuses via paginated get_flows."""
+    """Flow names and statuses, keyed by flow id.
+
+    Cached on the client, not in this module: a client built with other
+    credentials belongs to another Klaviyo account, and handing it the first
+    account's flow ids would filter a report down to ids that do not exist
+    there. That answers empty rather than erroring, which is the silent
+    undercount this module is about.
+    """
+    cached = getattr(client, "_flow_metadata", None)
+    if cached is not None:
+        return cached
     flows = {}
-    cursor = None
-    while True:
-        response = client.Flows.get_flows(page_cursor=cursor)
-        for f in response.data:
-            flows[f.id] = {
-                "flow_name": f.attributes.name,
-                "status": f.attributes.status,
+    for rows, _ in client.paged("flows", "flows"):
+        for row in rows:
+            attributes = row.get("attributes") or {}
+            flows[row["id"]] = {
+                "flow_name": attributes.get("name"),
+                "status": attributes.get("status"),
             }
-        if response.links and response.links.next:
-            cursor = response.links.next
-        else:
-            break
+    client._flow_metadata = flows
     return flows
 
 
-def _query_batch(client, flow_ids, start, end, channel, conversion_metric_id):
-    """Query reporting API for a batch of flow IDs."""
-    ids_str = ",".join(f'"{fid}"' for fid in flow_ids)
-    filter_str = f'contains-any(flow_id,[{ids_str}]),equals(send_channel,"{channel}")'
-
-    body = FlowValuesRequestDTO(
-        data=FlowValuesRequestDTOResourceObject(
-            type="flow-values-report",
-            attributes=FlowValuesRequestDTOResourceObjectAttributes(
-                statistics=STATS_FLOWS,
-                timeframe={"start": start, "end": end},
-                conversion_metric_id=conversion_metric_id,
-                group_by=["flow_id", "flow_message_id", "send_channel"],
-                filter=filter_str,
-            ),
-        )
-    )
-
-    results = []
-    response = retry_on_rate_limit(lambda: client.Reporting.query_flow_values(body))
-    for r in response.data.attributes.results:
-        results.append({**r.groupings, **r.statistics})
-    return results
+def _rows_from(payload):
+    """Flatten a flow values report into one dict per grouping."""
+    return [
+        {**(row.get("groupings") or {}), **(row.get("statistics") or {})}
+        for row in payload["data"]["attributes"].get("results") or []
+    ]
 
 
-def get_flow_report(start, end, channel="email", conversion_metric_id=CONVERSION_METRIC_ID):
-    """Fetch flow performance report for a date range.
-
-    Returns raw DataFrame from the API. No schema filtering or type coercion.
-    """
-    client = get_client()
-
-    metadata = _fetch_metadata(client)
-    all_ids = list(metadata.keys())
-
-    results = []
-    for i in range(0, len(all_ids), FLOW_BATCH_SIZE):
-        batch = all_ids[i:i + FLOW_BATCH_SIZE]
-        results.extend(_query_batch(client, batch, start, end, channel, conversion_metric_id))
-
+def _with_metadata(results, metadata):
+    """Build the frame and join the flow name and status onto it."""
     if not results:
         return pd.DataFrame()
-
     df = pd.DataFrame(results)
-    df["flow_name"] = df["flow_id"].map(lambda fid: metadata.get(fid, {}).get("flow_name"))
-    df["status"] = df["flow_id"].map(lambda fid: metadata.get(fid, {}).get("status"))
-
+    for column in ("flow_name", "status"):
+        df[column] = df["flow_id"].map(lambda fid: metadata.get(fid, {}).get(column))
     return df
 
 
-def _query_series_batch(client, flow_ids, start, end, channel, interval, conversion_metric_id):
-    """Query the flow series report for a batch of flow IDs.
+def get_flow_report(start, end, channel="email",
+                    conversion_metric_id=CONVERSION_METRIC_ID):
+    """Flow performance over a date range, one row per flow message.
 
-    Returns one dict per flow message per bucket. `bucket` is the bucket's
-    calendar date; Klaviyo labels REPORT_DAY_TZ days as midnight UTC.
-    """
-    ids_str = ",".join(f'"{fid}"' for fid in flow_ids)
-    filter_str = f'contains-any(flow_id,[{ids_str}]),equals(send_channel,"{channel}")'
+    Args:
+        start, end: ISO datetime strings. The offset in them is ignored:
+            Klaviyo cuts the days on its own fixed reporting clock.
+        channel: "email" or "sms".
+        conversion_metric_id: the metric revenue is attributed from.
 
-    body = FlowSeriesRequestDTO(
-        data=FlowSeriesRequestDTOResourceObject(
-            type="flow-series-report",
-            attributes=FlowSeriesRequestDTOResourceObjectAttributes(
-                statistics=STATS_FLOWS,
-                timeframe={"start": start, "end": end},
-                interval=interval,
-                conversion_metric_id=conversion_metric_id,
-                group_by=["flow_id", "flow_message_id", "send_channel"],
-                filter=filter_str,
-            ),
-        )
-    )
+    Returns:
+        A DataFrame with the groupings, every statistic in STATS_FLOWS, and
+        flow_name and status joined on. Empty if the period had no sends.
 
-    response = retry_on_rate_limit(lambda: client.Reporting.query_flow_series(body))
-    attrs = response.data.attributes
-    rows = []
-    for r in attrs.results:
-        for i, bucket in enumerate(attrs.date_times):
-            rows.append({
-                **r.groupings,
-                "bucket": bucket.date(),
-                **{stat: values[i] for stat, values in r.statistics.items()},
-            })
-    return rows
-
-
-def get_flow_series(start, end, channel="email", interval="daily", conversion_metric_id=CONVERSION_METRIC_ID):
-    """Fetch flow performance per time bucket for a date range.
-
-    Daily interval allows up to 60 days per call. Returns a long DataFrame,
-    one row per flow message per bucket, with a `bucket` date column plus
-    the STATS_FLOWS statistics, flow_name and status. No filtering.
+    Raises:
+        requests.HTTPError: the API refused, or answered a partial report it
+            offered no way to continue.
     """
     client = get_client()
-
     metadata = _fetch_metadata(client)
-    all_ids = list(metadata.keys())
-    batches = [all_ids[i:i + FLOW_BATCH_SIZE] for i in range(0, len(all_ids), FLOW_BATCH_SIZE)]
+    batches = list(id_batches(list(metadata), FILTER_BATCH))
 
-    log(f"querying {channel} flow series ({interval}, {start[:10]} to {end[:10]}), {len(all_ids)} flows")
+    log(f"querying {channel} flow values ({start[:10]} to {end[:10]}), "
+        f"{len(metadata)} flows in {len(batches)} call(s)")
     results = []
     for n, batch in enumerate(batches, 1):
-        rows = _query_series_batch(client, batch, start, end, channel, interval, conversion_metric_id)
+        payload = client.report("flow-values-reports", {
+            "statistics": STATS_FLOWS,
+            "timeframe": {"start": start, "end": end},
+            "conversion_metric_id": conversion_metric_id,
+            "filter": f'contains-any(flow_id,[{quoted(batch)}]),'
+                      f'equals(send_channel,"{channel}")',
+            "group_by": ["flow_id", "flow_message_id", "send_channel"],
+        })
+        rows = _rows_from(payload)
         log(f"  batch {n}/{len(batches)}: {len(rows)} rows")
         results.extend(rows)
 
-    if not results:
-        return pd.DataFrame()
+    return _with_metadata(results, metadata)
 
-    df = pd.DataFrame(results)
-    df["flow_name"] = df["flow_id"].map(lambda fid: metadata.get(fid, {}).get("flow_name"))
-    df["status"] = df["flow_id"].map(lambda fid: metadata.get(fid, {}).get("status"))
 
-    return df
+def get_flow_series(start, end, channel="email", interval="daily",
+                    conversion_metric_id=CONVERSION_METRIC_ID):
+    """Flow performance per message per bucket over a date range.
+
+    Args:
+        start, end: ISO datetime strings, as for get_flow_report. A daily
+            interval answers at most 60 days per call.
+        channel: "email" or "sms".
+        interval: "daily", "weekly" or "monthly".
+        conversion_metric_id: the metric revenue is attributed from.
+
+    Returns:
+        A long DataFrame, one row per flow message per bucket, carrying a
+        `bucket` date column alongside the statistics, flow_name and status.
+        Empty if the period had no sends.
+
+    Raises:
+        requests.HTTPError: the API refused, or answered a partial report it
+            offered no way to continue.
+    """
+    if interval == "daily":
+        span = (date.fromisoformat(end[:10]) - date.fromisoformat(start[:10])).days + 1
+        if span > WINDOW_DAILY:
+            raise ValueError(
+                f"a daily flow series answers at most {WINDOW_DAILY} days per call and "
+                f"{start[:10]} to {end[:10]} is {span}. Klaviyo does not say it has "
+                f"truncated, so this refuses rather than report a short series. Split "
+                f"the range, or ask for a coarser interval.")
+
+    client = get_client()
+    metadata = _fetch_metadata(client)
+    batches = list(id_batches(list(metadata), FILTER_BATCH))
+
+    log(f"querying {channel} flow series ({interval}, {start[:10]} to {end[:10]}), "
+        f"{len(metadata)} flows in {len(batches)} call(s)")
+    results = []
+    for n, batch in enumerate(batches, 1):
+        payload = client.report("flow-series-reports", {
+            "statistics": STATS_FLOWS,
+            "timeframe": {"start": start, "end": end},
+            "interval": interval,
+            "conversion_metric_id": conversion_metric_id,
+            "filter": f'contains-any(flow_id,[{quoted(batch)}]),'
+                      f'equals(send_channel,"{channel}")',
+            "group_by": ["flow_id", "flow_message_id", "send_channel"],
+        })
+        attributes = payload["data"]["attributes"]
+        buckets = [d.date() if hasattr(d, "date") else pd.Timestamp(d).date()
+                   for d in attributes.get("date_times") or []]
+        rows = []
+        for row in attributes.get("results") or []:
+            series = row.get("statistics") or {}
+            # A statistic array shorter than the bucket axis means the series
+            # was truncated. Filling the tail with None would pass straight
+            # through `.sum()`, which skips it, and lower the reported total
+            # with nothing to show for it.
+            short = [stat for stat, values in series.items()
+                     if len(values) != len(buckets)]
+            if short:
+                raise ValueError(
+                    f"flow series for {row.get('groupings')}: "
+                    f"{', '.join(short)} do not have one value per bucket "
+                    f"({len(buckets)} buckets). Refusing a partial series.")
+            for i, bucket in enumerate(buckets):
+                rows.append({
+                    **(row.get("groupings") or {}),
+                    "bucket": bucket,
+                    **{stat: values[i] for stat, values in series.items()},
+                })
+        log(f"  batch {n}/{len(batches)}: {len(rows)} rows")
+        results.extend(rows)
+
+    return _with_metadata(results, metadata)

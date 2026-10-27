@@ -1,15 +1,18 @@
-"""Klaviyo connector. Raw API access with retry handling."""
-import sys
-import time
+"""Klaviyo connector. Raw API access, paced to the account's call budget.
+
+`client.py` holds the transport: auth, retry, pagination and the pacing that
+keeps reporting calls under two a minute. Everything here is configuration read
+from `config.toml`, plus the one clock fact every caller needs.
+
+Read only. Nothing in this package writes to Klaviyo.
+"""
 import tomllib
 from datetime import timedelta, timezone
 from pathlib import Path
 
-from klaviyo_api import KlaviyoAPI
-from openapi_client.exceptions import ApiException
-
-from connectors.credentials import get_klaviyo_credentials
-
+from connectors.klaviyo.client import (
+    FILTER_BATCH, WINDOW_DAILY, KlaviyoAPI, id_batches, log, quoted,
+)
 
 _CONFIG_PATH = Path(__file__).parent / "config.toml"
 with open(_CONFIG_PATH, "rb") as f:
@@ -20,43 +23,31 @@ REPORT_DAY_TZ = timezone(timedelta(hours=CONFIG["account"]["report_day_utc_offse
 REPORT_DAY_LABEL = (f"Days run midnight to midnight UTC{CONFIG['account']['report_day_utc_offset']:+d}, "
                     "Klaviyo's reporting clock (11 PM to 11 PM Pacific during standard time)")
 CONVERSION_METRIC_ID = CONFIG["api"]["conversion_metric_id"]
-FLOW_BATCH_SIZE = CONFIG["api"]["flow_batch_size"]
 STATS_CAMPAIGNS = CONFIG["api"]["stats"]["campaigns"]
 STATS_FLOWS = CONFIG["api"]["stats"]["flows"]
 
-RETRY_CODES = set(CONFIG["api"]["retry"]["codes"])
-MAX_RETRIES = CONFIG["api"]["retry"]["max_retries"]
-DEFAULT_WAIT = CONFIG["api"]["retry"]["default_wait_seconds"]
-
-
-def log(msg):
-    print(f"[klaviyo] {msg}", file=sys.stderr, flush=True)
+_client = None
 
 
 def get_client(credentials=None):
-    # max_retries=0 disables the SDK's silent internal retry so
-    # retry_on_rate_limit is the only retry path. Without this, a 429
-    # inside an SDK call sleeps Retry-After up to 3x with no logging.
-    # credentials: optional {"api_key"} to inject (the OAuth/per-user lane);
-    # defaults to the environment-backed resolver.
-    creds = credentials or get_klaviyo_credentials()
-    return KlaviyoAPI(creds["api_key"], max_retries=0)
+    """The shared client, built on first use.
+
+    One instance per process on purpose: the pacing state lives on the client,
+    so two of them would each hold two calls a minute and together break the
+    limit. Passing credentials builds a separate one rather than reusing the
+    shared instance.
+    """
+    global _client
+    if credentials is not None:
+        return KlaviyoAPI(credentials)
+    if _client is None:
+        _client = KlaviyoAPI()
+    return _client
 
 
-def retry_on_rate_limit(fn, max_retries=None, default_wait=None):
-    """Call fn(), retrying on transient errors with logging on every wait."""
-    if max_retries is None:
-        max_retries = MAX_RETRIES
-    if default_wait is None:
-        default_wait = DEFAULT_WAIT
-    for attempt in range(1, max_retries + 1):
-        try:
-            return fn()
-        except ApiException as e:
-            if e.status not in RETRY_CODES or attempt == max_retries:
-                if e.status in RETRY_CODES:
-                    log(f"giving up after {attempt} attempts (status {e.status})")
-                raise
-            wait = int((e.headers or {}).get("retry-after", default_wait))
-            log(f"status {e.status}, sleeping {wait}s (attempt {attempt}/{max_retries})")
-            time.sleep(wait)
+__all__ = [
+    "KlaviyoAPI", "get_client", "log", "id_batches", "quoted",
+    "FILTER_BATCH", "WINDOW_DAILY",
+    "ACCOUNT_TIMEZONE", "REPORT_DAY_TZ", "REPORT_DAY_LABEL",
+    "CONVERSION_METRIC_ID", "STATS_CAMPAIGNS", "STATS_FLOWS",
+]

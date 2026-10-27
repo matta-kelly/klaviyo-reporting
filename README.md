@@ -1,195 +1,252 @@
 # Klaviyo Reporting
 
-Email and SMS performance from a Klaviyo account, by day and by period, with
-optional comparison against an earlier period. Console output always, PDF on
-request.
+Email and SMS performance from a Klaviyo account, by day and by period, with optional comparison against an earlier period. Console output always, PDF on request. Read only: it never writes to Klaviyo.
 
-Read only. It never writes to Klaviyo.
+## Setup
 
-## Why it reads a warehouse
-
-Klaviyo's reporting endpoints are rationed to 225 calls a day for the whole
-account and two a minute steady, so a single week's report against the API
-spends a minute or two mostly asleep and competes with every other report run
-that day.
-
-This reads the same numbers out of a Postgres warehouse, where a year costs the
-same as a week. The API path still exists as the reference: when a warehouse
-figure is doubted, run the same period both ways and diff them with
-`verify_sources`.
-
-## Install
+### Install
 
 ```
 uv sync
 cp .env.example .env     # then fill it in
 ```
 
-Needs Python 3.13.
+- needs Python 3.13
 
-## Run
+### Credentials
 
-From the repo root.
+- every variable is in `.env.example`, with what it is for
+- two things worth knowing before you ask for access
+	- the warehouse role only needs select on the `int` and `proc` schemas
+	- you need a Klaviyo key as well as the database, even though the numbers come from the database, see Caveat 1
+
+### Why it reads a warehouse, and what that costs you
+
+- Klaviyo's reporting endpoints are rationed
+	- 2 calls a minute steady
+	- 225 calls a day for the whole account, shared with the Klaviyo UI and every other job
+- the same numbers land in a Postgres warehouse on a schedule, where a year costs the same as a week, so that is the default
+- the client holds itself to the rate rather than eating 429s, which means **an API call is 31 seconds of waiting**
+	- so how you run it decides how long it takes
+	- a single day off the warehouse is instant, 0 calls
+	- any longer period spends about 6 calls, roughly 3 minutes, to fill the flow unique counts
+	- `KLAVIYO_REPORT_SOURCE=api` spends about 12, so roughly 6 minutes
+- the API path exists as the reference
+	- when a warehouse figure is doubted, run the period both ways and diff them with `verify_sources`
+- full detail in [Rate limits](#rate-limits)
+
+### Layout
+
+- `connectors/` one client per system, nothing above talks to a system directly
+	- `credentials.py` the single seam where credentials resolve
+	- `warehouse/` Postgres, read only, verified TLS
+	- `klaviyo/`
+		- `client.py` transport, auth, retry, pagination, pacing
+		- `campaigns.py` campaign values, plus the names
+		- `flows.py` flow values and flow series, with metadata cached per process
+		- `config.toml` the reporting clock, the conversion metric, the statistics asked for
+- `tools/klaviyo/` every verb that affects a number
+	- `source.py` picks the warehouse or the API backend
+	- `warehouse.py` the SQL and the day-to-period rollup
+	- `daily.py` day-grain loaders on the reporting clock
+	- `transforms.py` normalize names, classify engaged/unengaged, drop wholesale
+	- `metrics.py` totals and rates
+- `reporting/klaviyo/` the command line interface and the output
+	- `daily_report.py` the CLI
+	- `daily_render.py` the PDF, through WeasyPrint
+	- `general_report.py` the period summary
+	- `verify_sources.py` warehouse against API
+
+## Running it
 
 ```
 uv run python -m reporting.klaviyo.daily_report <start> <end>
 ```
 
-### Modes
-
-```
-<start> <end>                                      one period
-yoy <start> <end>                                  vs the same weekdays 364 days earlier
-compare <start> <end> <prior_start> <prior_end>    vs any other period
-full <start> <end>                                 vs both the week before and a year before
-```
-
-364 days, not 365, so every day pairs with the same weekday.
-
-### Flags
-
-```
---pdf [PATH]        also write the PDF; default reporting/klaviyo/reports/<title>.pdf
---title TEXT        override the report title
---labels A,B        override the period labels
-```
-
-### Example
+- from the repo root
+- modes
+	- `<start> <end>` one period
+	- `yoy <start> <end>` against the same weekdays 364 days earlier
+		- 364, not 365, so every day pairs with the same weekday
+	- `compare <start> <end> <prior_start> <prior_end>` against any other period
+	- `full <start> <end>` against both the week before and a year before
+- flags
+	- `--pdf [PATH]` also write the PDF, default `reporting/klaviyo/reports/<title>.pdf`
+	- `--title TEXT` override the report title
+	- `--labels A,B` override the period labels
+- example
 
 ```
 uv run python -m reporting.klaviyo.daily_report yoy 2026-10-19 2026-10-25 --pdf
 ```
 
-## Access it needs
+### The API escape hatch
 
-| Variable | Why |
-| --- | --- |
-| `WAREHOUSE_HOST`, `WAREHOUSE_USER`, `WAREHOUSE_DB`, `WAREHOUSE_PASSWORD` | Every number. A read-only role with select on the `int` and `proc` schemas is enough. |
-| `WAREHOUSE_PORT` | Optional, defaults to 5432. |
-| `KLAVIYO_API_KEY` | The flow unique counts, for any period longer than a day. Also the whole reference path. |
+- `KLAVIYO_REPORT_SOURCE=api` bypasses the warehouse entirely and reads everything from Klaviyo
+	- slow, and it spends the day's call budget
+	- but it needs no database
 
-A database connection on its own will not run this report. See the first caveat.
+## What the numbers mean
 
-## What it expects in the warehouse
+### Definitions
 
-One table and two dimensions, already modelled:
+- **reporting day**: midnight to midnight at a fixed UTC-7, all year
+	- Klaviyo reads a timeframe's dates on that clock and ignores any offset in the string
+	- that is Pacific during daylight time, and 11 PM to 11 PM Pacific during standard time
+- **revenue**: Klaviyo-attributed Placed Order value
+	- the metric ID is set in `connectors/klaviyo/config.toml`
+- **campaign**: one send to one segment
+	- the same email to five segments is five campaigns
+- **concept**: a campaign name with its segment parenthetical stripped
+	- so five segment versions of one email count as one idea
+- **flow**: a standing rule that sends continuously, so it has no send date
+	- flow figures are dated by the day of the event
+- **unique opens**: people who opened, not total open events
+- **engaged / unengaged**: read from the segment parenthetical in the campaign name
+	- not from Klaviyo's segment definition
+- **delivered**: recipients minus bounces
+	- campaign rates are over recipients
+	- flow rates are over delivered
 
-- `int.int_klaviyo__message_day`, one row per message per day, carrying
-  `source_type`, `channel`, `date`, `parent_id`, `message_id`, and the stat
-  columns (`recipients`, `delivered`, `opens_unique`, `clicks_unique`,
-  `bounced`, `unsubscribe_uniques`, `spam_complaints`, `conversion_uniques`,
-  `revenue`)
-- `proc.proc_klaviyo__campaigns`, one row per campaign, with `name`,
-  `send_time` and `status`
-- `proc.proc_klaviyo__flows`, one row per flow, with `name` and `status`
+### Caveat 1. Unique people do not add across days
 
-Days are Klaviyo reporting days, cut at a fixed UTC-7.
+- the warehouse holds one row per message per day
+- someone who clicks an SMS link on Monday and again on Thursday is
+	- one person to Klaviyo
+	- two to a sum of the two days
+- measured over September 2026, summing days read SMS flow unique clicks 8.1% high, while delivered and revenue matched exactly
+- affected, and only on flows
+	- `opens_unique`
+	- `clicks_unique`
+	- `conversion_uniques`
+	- plus the rates built on them: flow open rate, click rate, conversion rate
+- unaffected, these sum correctly
+	- recipients, delivered, bounced, revenue, unsubscribes, spam
+	- every campaign metric, because a campaign sends once and the warehouse holds one row for it
+- the consequence
+	- any period longer than one day needs a Klaviyo API key, not just a database connection
+	- `tools/klaviyo/warehouse.py` leaves those three columns empty for a message that ran on more than one day
+	- `tools/klaviyo/source.py` fills them with one API call per period
+	- the fill raises rather than returning a gap: the columns are nullable, and a silent sum over them would quietly undercount
 
-## Definitions
+### Caveat 2. Revenue is still moving for about a week
 
-| Term | Meaning |
-| --- | --- |
-| Reporting day | Midnight to midnight at a fixed UTC-7, all year. Klaviyo reads a timeframe's dates on that clock and ignores any offset in the string. That is Pacific during daylight time, and 11 PM to 11 PM Pacific during standard time. |
-| Revenue | Klaviyo-attributed Placed Order value. The metric ID is set in `connectors/klaviyo/config.toml`. |
-| Campaign | One send to one segment. The same email to five segments is five campaigns. |
-| Concept | A campaign name with its segment parenthetical stripped, so five segment versions of one email count as one idea. |
-| Flow | A standing rule that sends continuously, so it has no send date. Flow figures are dated by the day of the event. |
-| Unique opens | People who opened, not total open events. |
-| Engaged / unengaged | Read from the segment parenthetical in the campaign name, not from Klaviyo's segment definition. |
-| Delivered | Recipients minus bounces. Campaign rates are over recipients. Flow rates are over delivered. |
+- Klaviyo attributes orders to a send for several days after it goes out
+- a report run inside seven days of the period end is reading numbers that will rise
+- the report says so on the page
 
-## Caveats
+### Caveat 3. Older days are frozen
 
-### 1. Unique people do not add across days
+- the warehouse re-reads only a trailing window
+- a day more than a week old holds whatever it was worth when it was last read
+- against the API the number would still be catching up; here it has stopped for good
 
-The warehouse holds one row per message per day. Someone who clicks an SMS link
-on Monday and again on Thursday is one person to Klaviyo and two to a sum of
-the two days. Measured over September 2026, summing days read SMS flow unique
-clicks 8.1% high while delivered and revenue matched exactly.
+### Caveat 4. Flow recipients read about 1% low
 
-Three columns are affected, and only on flows:
+- measured against the Klaviyo UI for August 2026
+	- revenue matched to the cent on 11 of 13 flows
+	- conversions matched on 12 of 13
+	- seven flows were short on recipients by 0.2% to 2.1%
+- recipients cannot change after a send, so those are message-days that never landed
+- campaign figures matched exactly
 
-```
-opens_unique
-clicks_unique
-conversion_uniques
-```
+### Caveat 5. Scope
 
-Plus the rates built on them: flow open rate, click rate, conversion rate.
+- sent campaigns only
+- wholesale (WS) excluded
+- SMS has no open tracking, so SMS shows click rate only
 
-Everything else sums correctly: recipients, delivered, bounced, revenue,
-unsubscribes, spam. Every campaign metric is unaffected, because a campaign
-sends once and the warehouse holds one row for it.
+### Caveat 6. Rates are never averaged together
 
-So any period longer than one day needs a Klaviyo API key, not just a database
-connection. `tools/klaviyo/warehouse.py` leaves those three columns empty for a
-message that ran on more than one day, and `tools/klaviyo/source.py` fills them
-with one API call per period. The fill raises rather than returning a gap: the
-columns are nullable, and a silent sum over them would quietly undercount.
+- campaign and flow rates are reported separately
+- blending them hides which one moved
 
-### 2. Revenue is still moving for about a week
-
-Klaviyo attributes orders to a send for several days after it goes out. A report
-run inside seven days of the period end is reading numbers that will rise. The
-report says so on the page.
-
-### 3. Older days are frozen
-
-The warehouse re-reads only a trailing window, so a day more than a week old
-holds whatever it was worth when it was last read. Against the API the number
-would still be catching up. Here it has stopped for good.
-
-### 4. Flow recipients read about 1% low
-
-Measured against the Klaviyo UI for August 2026: revenue matched to the cent on
-11 of 13 flows and conversions on 12 of 13, but seven flows were short on
-recipients by 0.2% to 2.1%. Recipients cannot change after a send, so those are
-message-days that never landed. Campaign figures matched exactly.
-
-### 5. Scope
-
-Sent campaigns only. Wholesale (WS) is excluded. SMS has no open tracking, so
-SMS shows click rate only.
-
-### 6. Rates are never averaged together
-
-Campaign and flow rates are reported separately. Blending them hides which one
-moved.
-
-## Checking it
+### Checking it
 
 ```
 uv run python -m reporting.klaviyo.verify_sources <start> <end> [tolerance]
 ```
 
-Diffs every summary metric between the warehouse and the API and exits non-zero
-on drift. Default tolerance 0.5%. Costs a handful of reporting calls against the
-day's 225, all on the API side, so it is not for a schedule.
+- diffs every summary metric between the warehouse and the API
+- exits non-zero on drift, default tolerance 0.5%
+- costs a handful of reporting calls against the day's 225, all on the API side, so it is not for a schedule
+- a single day is the control
+	- at that grain the two sources are the same number by construction
+	- so a day that disagrees means something other than the rollup is wrong
 
-A single day is the control. At that grain the two sources are the same number
-by construction, so a day that disagrees means something other than the rollup
-is wrong.
+## Rate limits
 
-## Layout
+- Klaviyo rations the API by family, and the families do not behave alike
+- all of them sit behind one key, so every process using that key shares the budget
 
-```
-connectors/            one client per system; nothing above talks to a system directly
-  credentials.py       the single seam where credentials resolve
-  warehouse/           Postgres, read only, verified TLS
-  klaviyo/             the API client, rate limited
-tools/klaviyo/         every verb that affects a number
-  source.py            picks the warehouse or the API backend
-  warehouse.py         the SQL and the day-to-period rollup
-  daily.py             day-grain loaders on the reporting clock
-  transforms.py        normalize names, classify engaged/unengaged, drop wholesale
-  metrics.py           totals and rates
-reporting/klaviyo/     the command line interface and the output
-  daily_report.py      the CLI
-  daily_render.py      the PDF, through WeasyPrint
-  general_report.py    the period summary
-  verify_sources.py    warehouse against API
-```
+| Family | Method | Limit |
+| --- | --- | --- |
+| records (campaigns, flows, profiles) | GET, cursor paginated | hundreds a minute |
+| reports (campaign values, flow values, flow series) | POST | **2 a minute, 225 a day** |
+| counts (metric aggregates) | POST | 60 a minute |
 
-Set `KLAVIYO_REPORT_SOURCE=api` to bypass the warehouse entirely and read
-everything from Klaviyo. Slow, and it spends the day's call budget, but it
-needs no database.
+- the report budget, not the amount of data, is what shapes everything here
+- a report call costs the same whatever it returns, so the client asks for the widest window and every statistic at once rather than making more calls
+
+### The client paces itself
+
+- `connectors/klaviyo/client.py` holds
+	- 31 seconds between report calls
+	- 1.1 seconds between count calls
+- it stays under the steady rate instead of discovering the limit through 429s
+- waiting on purpose is faster than being throttled
+	- a 429 costs whatever `Retry-After` says, usually 60 seconds
+	- and the call still has to be made afterwards
+- this is why a report that touches the API takes minutes rather than seconds
+	- the time is the pacing, not the work
+- retry still exists underneath, because pacing only controls this process
+	- **429** waits out Klaviyo's own `Retry-After` header, not a fixed ladder
+		- a short retry would land inside the same window and be refused again
+	- **500, 502, 503, 504, 524** back off 5, 15, 30, 60, 120 seconds
+	- **dropped sockets and timeouts** take the same ladder
+		- a connection error never reaches a status code, so without this it escapes the retry path every other transient fault goes through, and kills the run
+	- five attempts, then it raises
+
+### One client per process
+
+- `get_client()` returns a shared instance
+- the pacing state lives on the client, so two of them would each hold two calls a minute and together break the limit
+- the limit is per account, not per process
+	- a scheduled job, someone running a report by hand, and the Klaviyo UI all draw on the same 225
+	- if a report starts getting throttled despite the pacing, something else is spending the budget
+
+### How many calls a report costs
+
+A flow report is one call per 100 flows, because `contains-any` caps its id list
+at 100. On an account with 220 flows that is 3 calls, and the unique fill runs
+once for email and once for SMS, so it is 6 rather than 1.
+
+| Run | Report calls | Wall clock |
+| --- | --- | --- |
+| warehouse, single day | 0 | instant |
+| warehouse, any longer period | about 6, to fill the flow unique counts | about 3 minutes |
+| warehouse, `yoy` or `compare` | about 12 | about 6 minutes |
+| `KLAVIYO_REPORT_SOURCE=api`, one period | about 12 | about 6 minutes |
+| `verify_sources` | the API cost above, for one period | |
+
+- measured on an account with 220 flows; halve the flows and you halve the calls
+
+### Silent failures to know about
+
+- two ways this API answers wrongly without erroring, both of which have happened here
+	- a flow report sent **without an explicit flow id filter** returns a subset rather than an error
+		- measured once at about 77% short
+		- every flow id is passed explicitly for this reason
+	- a segment series report with the segment passed as a **relationship** instead of a filter ignores it, and answers with another segment's numbers
+- report responses are parallel arrays, one entry per grouping
+	- so a truncated answer looks exactly like a complete one: fewer groupings, every array still the right length, nothing to notice
+	- the client follows continuations, and raises rather than returning a partial when a response says there is more and offers no cursor to reach it
+	- a wrong number that looks right is worse than no number
+
+### API revision
+
+- Klaviyo pins behaviour to a dated revision sent on every request
+- a revision stays stable for a year, then deprecates over the next year
+- omitting it or sending an unknown value is an error, not a fallback
+- the current one is `DEFAULT_REVISION` in `connectors/klaviyo/client.py`
+	- `KlaviyoAPI(revision=...)` overrides it

@@ -5,7 +5,7 @@ description = "Email and SMS performance reports from a Klaviyo account, read fr
 requires-python = ">=3.13"
 dependencies = [
     "pandas==3.0.1",
-    "klaviyo-api==22.0.0",
+    "requests==2.32.5",
     "psycopg2-binary==2.9.11",
     "certifi==2025.8.3",
     "weasyprint==68.1",

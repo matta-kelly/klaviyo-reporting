@@ -10,7 +10,11 @@ from connectors.klaviyo import REPORT_DAY_TZ
 
 def _send_days(send_time):
     """Count distinct send days on Klaviyo's reporting clock (send_time is UTC)."""
-    local = pd.to_datetime(send_time, utc=True).dt.tz_convert(REPORT_DAY_TZ)
+    # format="ISO8601" rather than the default: the API returns send_time with
+    # fractional seconds on some campaigns and without on others, and the
+    # default infers one format from the first value then fails on the rest.
+    local = (pd.to_datetime(send_time, format="ISO8601", utc=True)
+             .dt.tz_convert(REPORT_DAY_TZ))
     return local.dt.date.nunique()
 
 
