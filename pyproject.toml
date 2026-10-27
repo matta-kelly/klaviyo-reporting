@@ -1,0 +1,16 @@
+[project]
+name = "klaviyo-reporting"
+version = "0.1.0"
+description = "Email and SMS performance reports from a Klaviyo account, read from a Postgres warehouse."
+requires-python = ">=3.13"
+dependencies = [
+    "pandas==3.0.1",
+    "klaviyo-api==22.0.0",
+    "psycopg2-binary==2.9.11",
+    "certifi==2025.8.3",
+    "weasyprint==68.1",
+]
+
+[tool.uv]
+# Run-from-root repo, not an installable package.
+package = false

@@ -1,0 +1,41 @@
+# Klaviyo connector config.
+
+[account]
+timezone = "US/Pacific"
+# Klaviyo reporting days run midnight to midnight at this fixed UTC offset all
+# year: a timeframe's dates are read on this clock and any offset in the string
+# is ignored. That is Pacific time during daylight time and 11 PM to 11 PM
+# Pacific during standard time. Flow series buckets are days on this clock.
+report_day_utc_offset = -7
+
+[api]
+conversion_metric_id = "R8revz"  # Shopify Placed Order
+flow_batch_size = 100             # max IDs per contains-any filter
+
+[api.retry]
+# Mirrors the codes the Klaviyo SDK retries on. SDK's internal retry is
+# disabled (max_retries=0 in get_client) so this is the only retry path.
+codes = [104, 429, 503, 504, 524]
+max_retries = 5
+default_wait_seconds = 60
+
+[api.stats]
+campaigns = [
+  "recipients",
+  "delivered",
+  "opens_unique",
+  "clicks_unique",
+  "bounced",
+  "unsubscribe_uniques",
+  "spam_complaints",
+  "conversion_uniques",
+  "conversion_value",
+]
+flows = [
+  "recipients",
+  "delivered",
+  "opens_unique",
+  "clicks_unique",
+  "conversion_uniques",
+  "conversion_value",
+]
